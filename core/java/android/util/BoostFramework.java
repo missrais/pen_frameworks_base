@@ -60,8 +60,10 @@ import java.lang.reflect.Method;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
+import dalvik.system.PathClassLoader;
 
 import android.view.Display;
 
@@ -363,7 +365,13 @@ public class BoostFramework {
 // QTI_BEGIN: 2018-02-20: Performance: BoostFramework: To Enhance performance.
                 try {
 // QTI_END: 2018-02-20: Performance: BoostFramework: To Enhance performance.
-                    sPerfClass = Class.forName(PERFORMANCE_CLASS);
+                    if (new File(PERFORMANCE_JAR).exists()) {
+                        PathClassLoader perfClassLoader = new PathClassLoader(
+                                PERFORMANCE_JAR, ClassLoader.getSystemClassLoader());
+                        sPerfClass = perfClassLoader.loadClass(PERFORMANCE_CLASS);
+                    } else {
+                        sPerfClass = Class.forName(PERFORMANCE_CLASS);
+                    }
 // QTI_BEGIN: 2018-02-20: Performance: BoostFramework: To Enhance performance.
 
                     Class[] argClasses = new Class[] {int.class, int[].class};
@@ -451,18 +459,25 @@ public class BoostFramework {
                     }
 
 // QTI_END: 2018-10-31: Core: IOP/UXE: This change is related to IOP and UXE Feature.
-                    sIsLoaded = true;
-// QTI_BEGIN: 2018-02-20: Performance: BoostFramework: To Enhance performance.
                 }
                 catch(Exception e) {
-                    Log.e(TAG,"BoostFramework() : Exception_1 = " + e);
+                    Log.w(TAG,"BoostFramework() : Exception_1 = " + e);
+                }
+                finally {
+                    sIsLoaded = true;
                 }
 // QTI_END: 2018-02-20: Performance: BoostFramework: To Enhance performance.
 // QTI_BEGIN: 2018-10-31: Core: IOP/UXE: This change is related to IOP and UXE Feature.
                 // Load UXE Class now Adding new try/catch block to avoid
                 // any interference with Qperformance
                 try {
-                    sUxPerfClass = Class.forName(UXPERFORMANCE_CLASS);
+                    if (new File(UXPERFORMANCE_JAR).exists()) {
+                        PathClassLoader uxPerfClassLoader = new PathClassLoader(
+                                UXPERFORMANCE_JAR, ClassLoader.getSystemClassLoader());
+                        sUxPerfClass = uxPerfClassLoader.loadClass(UXPERFORMANCE_CLASS);
+                    } else {
+                        sUxPerfClass = Class.forName(UXPERFORMANCE_CLASS);
+                    }
 
                     Class[] argUxClasses = new Class[] {int.class, String.class, String.class};
 // QTI_END: 2018-10-31: Core: IOP/UXE: This change is related to IOP and UXE Feature.
@@ -470,11 +485,12 @@ public class BoostFramework {
                     sUxIOPStart = sUxPerfClass.getDeclaredMethod("perfIOPrefetchStart", argUxClasses);
 // QTI_END: 2019-05-30: Core: Perf: Change for AGPE
 // QTI_BEGIN: 2018-10-31: Core: IOP/UXE: This change is related to IOP and UXE Feature.
-
-                    sUxIsLoaded = true;
                 }
                 catch(Exception e) {
-                    Log.e(TAG,"BoostFramework() Ux Perf: Exception = " + e);
+                    Log.w(TAG,"BoostFramework() Ux Perf: Exception = " + e);
+                }
+                finally {
+                    sUxIsLoaded = true;
                 }
 // QTI_END: 2018-10-31: Core: IOP/UXE: This change is related to IOP and UXE Feature.
 // QTI_BEGIN: 2018-02-20: Performance: BoostFramework: To Enhance performance.
@@ -722,18 +738,24 @@ public class BoostFramework {
 
 /** @hide */
     public String perfGetProp(String prop_name, String def_val) {
-        String ret = "";
+        String ret = def_val;
         try {
-            if (sPerfGetPropFunc != null) {
+            if (sPerfGetPropFunc != null && mPerf != null) {
                 Object retVal = sPerfGetPropFunc.invoke(mPerf, prop_name, def_val);
-                ret = (String)retVal;
-            }else {
+                if (retVal != null) {
+                    String str = (String)retVal;
+                    if (!str.isEmpty()) {
+                        ret = str;
+                    }
+                }
+            } else {
                 ret = def_val;
             }
         } catch(Exception e) {
             Log.e(TAG,"Exception " + e);
+            ret = def_val;
         }
-        return ret;
+        return (ret == null || ret.isEmpty()) ? def_val : ret;
     }
 
 /** @hide */

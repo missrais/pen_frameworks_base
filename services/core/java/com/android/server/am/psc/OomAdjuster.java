@@ -856,16 +856,23 @@ public abstract class OomAdjuster {
 
         mLogger = new OomAdjusterDebugLogger(this, mOomConstants);
         if(mPerf != null) {
-            mMinBServiceAgingTime = Integer.valueOf(mPerf.perfGetProp("ro.vendor.qti.sys.fw.bservice_age", "5000"));
-            mBServiceAppThreshold = Integer.valueOf(mPerf.perfGetProp("ro.vendor.qti.sys.fw.bservice_limit", "5"));
-            mEnableBServicePropagation = Boolean.parseBoolean(mPerf.perfGetProp("ro.vendor.qti.sys.fw.bservice_enable", "false"));
+            try {
+                String age = mPerf.perfGetProp("ro.vendor.qti.sys.fw.bservice_age", "5000");
+                mMinBServiceAgingTime = (age != null && !age.isEmpty()) ? Integer.valueOf(age) : 5000;
+                String limit = mPerf.perfGetProp("ro.vendor.qti.sys.fw.bservice_limit", "5");
+                mBServiceAppThreshold = (limit != null && !limit.isEmpty()) ? Integer.valueOf(limit) : 5;
+                mEnableBServicePropagation = Boolean.parseBoolean(mPerf.perfGetProp("ro.vendor.qti.sys.fw.bservice_enable", "false"));
 // QTI_BEGIN: 2020-04-03: Core: cgroup follow for procs in the same cgroup.procs
-            mEnableProcessGroupCgroupFollow = Boolean.parseBoolean(mPerf.perfGetProp("ro.vendor.qti.cgroup_follow.enable", "false"));
-            mProcessGroupCgroupFollowDex2oatOnly = Boolean.parseBoolean(mPerf.perfGetProp("ro.vendor.qti.cgroup_follow.dex2oat_only", "false"));
+                mEnableProcessGroupCgroupFollow = Boolean.parseBoolean(mPerf.perfGetProp("ro.vendor.qti.cgroup_follow.enable", "false"));
+                mProcessGroupCgroupFollowDex2oatOnly = Boolean.parseBoolean(mPerf.perfGetProp("ro.vendor.qti.cgroup_follow.dex2oat_only", "false"));
 // QTI_END: 2020-04-03: Core: cgroup follow for procs in the same cgroup.procs
 // QTI_BEGIN: 2020-07-09: Core: Hooks for background apps transition
-            mEnableBgt = Boolean.parseBoolean(mPerf.perfGetProp("vendor.perf.bgt.enable","false"));
+                mEnableBgt = Boolean.parseBoolean(mPerf.perfGetProp("vendor.perf.bgt.enable","false"));
 // QTI_END: 2020-07-09: Core: Hooks for background apps transition
+            } catch (Exception e) {
+                mMinBServiceAgingTime = 5000;
+                mBServiceAppThreshold = 5;
+            }
         }
 
         mProcessGroupHandler = new Handler(adjusterThread.getLooper(), msg -> {
