@@ -42,6 +42,7 @@ import androidx.annotation.NonNull;
 import com.android.app.animation.Interpolators;
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.internal.policy.SystemBarUtils;
+import com.android.systemui.penguin.LockscreenStack;
 import com.android.systemui.animation.ShadeInterpolation;
 import com.android.systemui.clocks.ClockStyle;
 import com.android.systemui.qs.shared.style.LiquidGlass;
@@ -194,6 +195,16 @@ public class NotificationShelf extends ActivatableNotificationView {
         return mShelfIcons;
     }
 
+    /** Whether any of the shelf's icons is placed and fully shown. */
+    public boolean hasShownIcons() {
+        if (mShelfIcons == null) return false;
+        for (int i = 0; i < mShelfIcons.getChildCount(); i++) {
+            final View icon = mShelfIcons.getChildAt(i);
+            if (icon.getVisibility() == VISIBLE && icon.getAlpha() > 0.99f) return true;
+        }
+        return false;
+    }
+
     @Override
     @NonNull
     public ExpandableViewState createExpandableViewState() {
@@ -260,7 +271,9 @@ public class NotificationShelf extends ActivatableNotificationView {
             viewState.hidden = !mAmbientState.isShadeExpanded()
                     || mAmbientState.isPulsing()
                     || algorithmState.firstViewInShelf == null
-                    || (mAmbientState.isOnKeyguard() && mDisableNotificationShelfOnKeyguard);
+                    || (mAmbientState.isOnKeyguard() && mDisableNotificationShelfOnKeyguard)
+                    // The lock screen stack expanded in place scrolls instead.
+                    || LockscreenStack.isExpanded();
 
             final int indexOfFirstViewInShelf = algorithmState.visibleChildren.indexOf(
                     algorithmState.firstViewInShelf);
@@ -1032,6 +1045,17 @@ public class NotificationShelf extends ActivatableNotificationView {
                     iconState.iconAppearAmount);
         }
         iconState.iconColor = shelfColor;
+    }
+
+    /**
+     * Places the icons straight in their spots instead of animating them in from the cards: while
+     * the lock screen stack folds, the cards are drawn somewhere other than where they are laid
+     * out, so icons flying in from them start outside the cards.
+     */
+    public void setIconAnimationsEnabled(boolean enabled) {
+        if (mShelfIcons != null) {
+            mShelfIcons.setAnimationsEnabled(enabled);
+        }
     }
 
     private NotificationIconContainer.IconState getIconState(StatusBarIconView icon) {
