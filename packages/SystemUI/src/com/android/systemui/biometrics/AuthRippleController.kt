@@ -285,8 +285,10 @@ constructor(
     private val udfpsControllerCallback =
         object : UdfpsController.Callback {
             override fun onFingerDown() {
-                // only show dwell ripple for device entry
-                if (keyguardUpdateMonitor.isFingerprintDetectionRunning) {
+                // only show dwell ripple for device entry, and for screen-off presses
+                if (keyguardUpdateMonitor.isFingerprintDetectionRunning &&
+                        (udfpsController?.isAnimationEnabled() == false ||
+                            udfpsController?.isScreenOffPress() == true)) {
                     if (SceneContainerFlag.isEnabled) {
                         authRippleInteractor.sendAuthRippleEvent(
                             AuthRippleInteractor.AuthRippleEvent.PulseOut
@@ -302,7 +304,7 @@ constructor(
                     authRippleInteractor.sendAuthRippleEvent(
                         AuthRippleInteractor.AuthRippleEvent.Retract
                     )
-                } else {
+                } else if (udfpsController?.isAnimationEnabled() == false) {
                     mView.retractDwellRipple()
                 }
             }

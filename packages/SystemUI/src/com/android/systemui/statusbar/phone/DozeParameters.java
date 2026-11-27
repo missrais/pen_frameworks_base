@@ -68,6 +68,10 @@ import java.util.concurrent.Executor;
 
 import javax.inject.Inject;
 
+import kotlinx.coroutines.flow.MutableStateFlow;
+import kotlinx.coroutines.flow.StateFlow;
+import kotlinx.coroutines.flow.StateFlowKt;
+
 /**
  * Retrieve doze information
  */
@@ -111,6 +115,10 @@ public class DozeParameters implements
     private boolean mControlScreenOffAnimation;
     private boolean mIsQuickPickupEnabled;
     private boolean mScreenOffPeekActive;
+    private boolean mUdfpsIconActive;
+    private boolean mUdfpsIconPulsing;
+    private java.util.function.BooleanSupplier mUdfpsIconTapHandler;
+    private final MutableStateFlow<Boolean> mUdfpsIconOnly = StateFlowKt.MutableStateFlow(false);
 
     private boolean mKeyguardVisible;
     @VisibleForTesting
@@ -189,6 +197,7 @@ public class DozeParameters implements
                 this,
                 Settings.Secure.DOZE_ALWAYS_ON,
                 Settings.Secure.DOZE_PEEK,
+                Settings.Secure.DOZE_UDFPS_ICON,
                 Settings.Secure.ACCESSIBILITY_DISPLAY_INVERSION_ENABLED);
         configurationController.addCallback(this);
         statusBarStateController.addCallback(this);
@@ -318,7 +327,14 @@ public class DozeParameters implements
      * @return {@code true} if enabled and available.
      */
     public boolean getAlwaysOn() {
-        boolean alwaysOnEnabled = mAmbientDisplayConfiguration.alwaysOnEnabled(mUserTracker.getUserId());
+        return getAlwaysOnWithoutUdfpsIcon()
+                || (mUdfpsIconActive && !mBatteryController.isAodPowerSave());
+    }
+
+    /** Whether AOD is wanted for anything other than the screen-off fingerprint icon. */
+    public boolean getAlwaysOnWithoutUdfpsIcon() {
+        boolean alwaysOnEnabled =
+                mAmbientDisplayConfiguration.alwaysOnContentEnabled(mUserTracker.getUserId());
         boolean baseAlwaysOn = ((alwaysOnEnabled || mScreenOffPeekActive)
                 && !mBatteryController.isAodPowerSave())
                 || isMinModeActive();
@@ -333,6 +349,46 @@ public class DozeParameters implements
     public boolean shouldShowAodUi() {
         return getAlwaysOn()
                 || mAmbientDisplayConfiguration.screenOffPeekEnabled(mUserTracker.getUserId());
+    }
+
+    /**
+     * Sets whether the fingerprint icon keeps the screen in AOD while AOD itself is off, and
+     * whether a pulse is showing, which brings back the rest of the AOD content.
+     */
+    public void setUdfpsIconState(boolean active, boolean pulsing) {
+        mUdfpsIconPulsing = pulsing;
+        if (mUdfpsIconActive == active) {
+            updateUdfpsIconOnly();
+            return;
+        }
+        mUdfpsIconActive = active;
+        updateControlScreenOff();
+        dispatchAlwaysOnEvent();
+    }
+
+    /** Penguin: lets the doze icon controller show the fingerprint icon after a screen tap. */
+    public void setUdfpsIconTapHandler(java.util.function.BooleanSupplier handler) {
+        mUdfpsIconTapHandler = handler;
+    }
+
+    /** Shows the screen-off fingerprint icon for a moment; false if it can't be shown. */
+    public boolean showUdfpsIconForTap() {
+        final java.util.function.BooleanSupplier handler = mUdfpsIconTapHandler;
+        return handler != null && handler.getAsBoolean();
+    }
+
+    public boolean isUdfpsIconActive() {
+        return mUdfpsIconActive;
+    }
+
+    /** True while the fingerprint icon is the only thing to show on the dozing screen. */
+    public StateFlow<Boolean> getUdfpsIconOnly() {
+        return mUdfpsIconOnly;
+    }
+
+    private void updateUdfpsIconOnly() {
+        mUdfpsIconOnly.setValue(mUdfpsIconActive && !mUdfpsIconPulsing
+                && !getAlwaysOnWithoutUdfpsIcon());
     }
 
     public void setScreenOffPeekActive(boolean active) {
@@ -363,6 +419,11 @@ public class DozeParameters implements
      *
      * @return {@code true} if screen needs to be completely black before a power transition.
      */
+    /** Penguin: whether ambient pulses keep the display in doze, the panel's AOD mode. */
+    public boolean shouldPulseInDozeState() {
+        return mResources.getBoolean(R.bool.config_dozePulseInDozeState);
+    }
+
     public boolean getDisplayNeedsBlanking() {
         return FORCE_BLANKING || !FORCE_NO_BLANKING && mResources.getBoolean(
                 com.android.internal.R.bool.config_displayBlanksAfterDoze);
@@ -516,7 +577,8 @@ public class DozeParameters implements
     @Override
     public void onTuningChanged(String key, String newValue) {
         if (key.equals(Settings.Secure.DOZE_ALWAYS_ON)
-                || key.equals(Settings.Secure.DOZE_PEEK)) {
+                || key.equals(Settings.Secure.DOZE_PEEK)
+                || key.equals(Settings.Secure.DOZE_UDFPS_ICON)) {
             updateControlScreenOff();
         }
 
@@ -571,6 +633,8 @@ public class DozeParameters implements
     @Override
     public void dump(@NonNull PrintWriter pw, @NonNull String[] args) {
         pw.print("getAlwaysOn(): "); pw.println(getAlwaysOn());
+        pw.print("udfpsIconActive: "); pw.println(mUdfpsIconActive);
+        pw.print("udfpsIconOnly: "); pw.println(mUdfpsIconOnly.getValue());
         pw.print("getDisplayStateSupported(): "); pw.println(getDisplayStateSupported());
         pw.print("getPulseDuration(): "); pw.println(getPulseDuration());
         pw.print("getPulseInDuration(): "); pw.println(getPulseInDuration());
@@ -590,6 +654,7 @@ public class DozeParameters implements
     private void dispatchAlwaysOnEvent() {
         mScreenOffAnimationController.onAlwaysOnChanged(getAlwaysOn());
         mDozeInteractor.setAodAvailable(getAlwaysOn());
+        updateUdfpsIconOnly();
 
     }
 

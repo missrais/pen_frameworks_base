@@ -7567,10 +7567,20 @@ public final class Settings {
         public static final String SMART_5G = "smart_5g";
 
         /**
+         * @hide
+         */
+        public static final String UDFPS_ANIM_STYLE = "udfps_anim_style";
+
+        /**
          * Controls whether gestures are enabled.
          * @hide
          */
         public static final String GESTURES_ENABLED = "gestures_enabled";
+
+        /**
+         * @hide
+         */
+        public static final String UDFPS_ICON = "udfps_icon";
 
         /**
          * Controls whether double tap to wake is enabled.
@@ -11820,6 +11830,17 @@ public final class Settings {
          */
         @Readable
         public static final String DOZE_PEEK_DURATION = "doze_peek_duration";
+
+        /**
+         * Indicates whether the under-display fingerprint icon should stay on the dark screen
+         * while always-on display is off.
+         * <p>
+         * Type: int (0 for false, 1 for true)
+         *
+         * @hide
+         */
+        @Readable
+        public static final String DOZE_UDFPS_ICON = "doze_udfps_icon";
 
         /**
          * Indicates whether doze should show on shake gesture.

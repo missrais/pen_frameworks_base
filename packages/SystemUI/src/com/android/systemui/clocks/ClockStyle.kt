@@ -96,8 +96,6 @@ class ClockStyle @JvmOverloads constructor(
     private var currentShiftX = 0
     private var currentShiftY = 0
 
-    private var naturalClockHeight = 0
-
     private var pendingLayoutListener: View.OnLayoutChangeListener? = null
     private var clockSizeListener: View.OnLayoutChangeListener? = null
 
@@ -391,22 +389,30 @@ class ClockStyle @JvmOverloads constructor(
                 .alpha(minOf(clockOpacity, AOD_OPACITY_CAP) / 100f)
                 .setDuration(AOD_ANIM_OUT_MS)
                 .setInterpolator(AccelerateInterpolator(1.5f))
+                // The frame follows the clock down, so what sits below it moves with the clock.
+                .setUpdateListener { applyContainerHeight(view.scaleY) }
                 .withEndAction {
                     applyClockAlpha()
                     view.scaleX = AOD_SCALE_DOWN
                     view.scaleY = AOD_SCALE_DOWN
+                    applyContainerHeight(AOD_SCALE_DOWN)
                 }
                 .start()
         } else {
             view.scaleX = AOD_SCALE_DOWN
             view.scaleY = AOD_SCALE_DOWN
             val targetScale = getScaleFactor()
+            applyContainerHeight(AOD_SCALE_DOWN)
             view.animate()
                 .scaleX(targetScale)
                 .scaleY(targetScale)
                 .alpha(clockOpacity / 100f)
                 .setDuration(AOD_ANIM_IN_MS)
                 .setInterpolator(OvershootInterpolator(1.2f))
+                // Follow the clock up. The overshoot draws into the gap below instead of
+                // bouncing the notification stack.
+                .setUpdateListener { applyContainerHeight(minOf(view.scaleY, targetScale)) }
+                .withEndAction { applyContainerHeight(targetScale) }
                 .start()
         }
     }
@@ -447,8 +453,6 @@ class ClockStyle @JvmOverloads constructor(
         currentClockView = null
         textClocks.clear()
         styledTextViews.clear()
-        naturalClockHeight = 0
-        clockContainer?.minimumHeight = 0
 
         if (clockStyle in 1 until CLOCK_LAYOUTS.size) {
             val stub = clockStub
@@ -700,30 +704,15 @@ class ClockStyle @JvmOverloads constructor(
         view.pivotX = if (view.tag == PIVOT_START_TAG) 0f else view.width / 2f
         view.pivotY = 0f
         disableClippingOnParents(view)
-        if (naturalClockHeight == 0 && view.height > 0) {
-            naturalClockHeight = view.height
-        }
+        applyContainerHeight(scale)
+    }
 
-        if (naturalClockHeight > 0) {
-            val scaledHeight = (naturalClockHeight * scale).toInt()
-            val container = clockContainer ?: return
-            if (scale >= 1.0f) {
-                container.minimumHeight = scaledHeight
-                val lp = container.layoutParams
-                if (lp != null) {
-                    lp.height = ViewGroup.LayoutParams.WRAP_CONTENT
-                    container.layoutParams = lp
-                }
-            } else {
-                container.minimumHeight = 0
-                val lp = container.layoutParams
-                if (lp != null) {
-                    lp.height = scaledHeight
-                    container.layoutParams = lp
-                }
-            }
-            container.requestLayout()
-        }
+    /**
+     * Sizes the container for a clock drawn at [scale]. The container is what the keyguard clips
+     * to, so it has to follow the scale the clock is animating to, not only the one it started at.
+     */
+    private fun applyContainerHeight(scale: Float) {
+        (clockContainer as? ClockScaleFrame)?.drawScale = scale
     }
 
     private fun applyClockScaleAfterLayout(view: View) {
@@ -739,9 +728,6 @@ class ClockStyle @JvmOverloads constructor(
             ) {
                 v.removeOnLayoutChangeListener(this)
                 if (pendingLayoutListener === this) pendingLayoutListener = null
-                if (naturalClockHeight == 0) {
-                    naturalClockHeight = v.height
-                }
                 applyClockScale()
                 if (gradientEnabled) applyClockColors()
             }

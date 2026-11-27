@@ -24,6 +24,7 @@ import static android.hardware.biometrics.BiometricRequestConstants.REASON_AUTH_
 import static android.hardware.biometrics.BiometricRequestConstants.REASON_AUTH_KEYGUARD;
 import static android.hardware.biometrics.BiometricRequestConstants.REASON_ENROLL_ENROLLING;
 import static android.hardware.biometrics.BiometricRequestConstants.REASON_ENROLL_FIND_SENSOR;
+import static android.hardware.biometrics.BiometricSourceType.FINGERPRINT;
 
 import static com.android.internal.util.LatencyTracker.ACTION_UDFPS_ILLUMINATE;
 import static com.android.internal.util.LatencyTracker.ACTION_UDFPS_OVERLAY_ATTACHED_AFTER_GOING_TO_SLEEP;
@@ -34,9 +35,12 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.ActivityInfo;
+import android.content.res.Configuration;
 import android.graphics.Rect;
 import android.hardware.biometrics.BiometricFingerprintConstants;
 import android.hardware.biometrics.BiometricPrompt;
+import android.hardware.biometrics.BiometricSourceType;
 import android.hardware.biometrics.SensorProperties;
 import android.hardware.display.DisplayManager;
 import android.hardware.fingerprint.FingerprintManager;
@@ -69,12 +73,15 @@ import androidx.annotation.Nullable;
 import com.android.internal.R;
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.internal.logging.InstanceId;
+import com.android.internal.util.custom.CustomUtils;
 import com.android.internal.util.LatencyTracker;
 import com.android.keyguard.KeyguardUpdateMonitor;
+import com.android.keyguard.KeyguardUpdateMonitorCallback;
 import com.android.keyguard.UserActivityNotifier;
 import com.android.systemui.Dumpable;
 import com.android.systemui.Flags;
 import com.android.systemui.animation.ActivityTransitionAnimator;
+import com.android.systemui.biometrics.AuthController;
 import com.android.systemui.biometrics.dagger.BiometricsBackground;
 import com.android.systemui.biometrics.domain.interactor.UdfpsOverlayInteractor;
 import com.android.systemui.biometrics.shared.model.UdfpsOverlayParams;
@@ -192,6 +199,7 @@ public class UdfpsController implements DozeReceiver, Dumpable {
     @NonNull private final BrightnessMirrorShowingInteractor mBrightnessMirrorShowingInteractor;
     @NonNull private final CoroutineScope mScope;
     @NonNull private final InputManager mInputManager;
+    @NonNull private final AuthController mAuthController;
     @NonNull private final SelectedUserInteractor mSelectedUserInteractor;
     @NonNull private final MSDLPlayer mMsdlPlayer;
     private final Lazy<SceneInteractor> mSceneInteractorLazy;
@@ -231,6 +239,8 @@ public class UdfpsController implements DozeReceiver, Dumpable {
     private boolean mScreenOn;
     private Runnable mAodInterruptRunnable;
     private boolean mOnFingerDown;
+    private boolean mUltrasonicDown;
+    private boolean mScreenOffPress;
     private boolean mAttemptedToDismissKeyguard;
     private final Set<Callback> mCallbacks = new HashSet<>();
 
@@ -242,6 +252,9 @@ public class UdfpsController implements DozeReceiver, Dumpable {
     private boolean mSmartPixelsFlag;
     private boolean mSmartPixelsEnabled;
 
+
+    private UdfpsAnimation mUdfpsAnimation;
+    private boolean mKeyguardCallbackRegistered = false;
 
     @VisibleForTesting
     public static final VibrationAttributes UDFPS_VIBRATION_ATTRIBUTES =
@@ -303,6 +316,52 @@ public class UdfpsController implements DozeReceiver, Dumpable {
                 public void onViewDetachedFromWindow(@NonNull View v) {}
             };
 
+    private final Configuration mLastConfig = new Configuration();
+    private final ConfigurationController.ConfigurationListener mConfigurationListener =
+            new ConfigurationController.ConfigurationListener() {
+                @Override
+                public void onConfigChanged(Configuration newConfig) {
+                    // Only the window size and position depend on the configuration.
+                    final int changes = mLastConfig.updateFrom(newConfig);
+                    if ((changes & (ActivityInfo.CONFIG_DENSITY | ActivityInfo.CONFIG_ORIENTATION
+                            | ActivityInfo.CONFIG_SCREEN_SIZE)) != 0) {
+                        updateUdfpsAnimation();
+                    }
+                }
+            };
+
+    private final KeyguardUpdateMonitorCallback mKeyguardCallback = new KeyguardUpdateMonitorCallback() {
+        @Override
+        public void onBiometricAuthFailed(@NonNull BiometricSourceType type) {
+            if (type == FINGERPRINT && mOverlay != null) {
+                mFgExecutor.execute(() -> hideUdfpsAnimation());
+            }
+        }
+
+        @Override
+        public void onBiometricError(int msgId, String errString,
+                @NonNull BiometricSourceType type) {
+            if (type == FINGERPRINT && mOverlay != null) {
+                mFgExecutor.execute(() -> hideUdfpsAnimation());
+            }
+        }
+
+        @Override
+        public void onLockedOutStateChanged(@NonNull BiometricSourceType type) {
+            if (type == FINGERPRINT && mOverlay != null) {
+                mFgExecutor.execute(() -> hideUdfpsAnimation());
+            }
+        }
+
+        @Override
+        public void onBiometricAuthenticated(int userId, BiometricSourceType type,
+                boolean isStrongBiometric) {
+            if (mOverlay != null) {
+                mFgExecutor.execute(() -> hideUdfpsAnimation());
+            }
+        }
+    };
+
     @Override
     public void dump(@NonNull PrintWriter pw, @NonNull String[] args) {
         final int touchConfigId = mContext.getResources().getInteger(
@@ -355,6 +414,13 @@ public class UdfpsController implements DozeReceiver, Dumpable {
                             + "mKeyguardUpdateMonitor.isFingerprintDetectionRunning()=true");
                 }
 
+                if (mScreenOffPress) {
+                    for (Callback cb : mCallbacks) {
+                        cb.onFingerUp();
+                    }
+                }
+                mUltrasonicDown = false;
+                mScreenOffPress = false;
                 UdfpsController.this.hideUdfpsOverlay();
             });
         }
@@ -367,15 +433,37 @@ public class UdfpsController implements DozeReceiver, Dumpable {
             if (isUltrasonic()) {
                 if (acquiredInfo == FINGERPRINT_ACQUIRED_START) {
                     mFgExecutor.execute(() -> {
+                        mUltrasonicDown = true;
                         for (Callback cb : mCallbacks) {
                             cb.onFingerDown();
+                        }
+                        showUdfpsAnimation();
+                    });
+                } else if (acquiredInfo == FINGERPRINT_ACQUIRED_GOOD) {
+                    // Screen-off presses only report the good image, too late to animate.
+                    mFgExecutor.execute(() -> {
+                        if (!mUltrasonicDown && mStatusBarStateController.isDozing()) {
+                            mUltrasonicDown = true;
+                            mScreenOffPress = true;
+                            for (Callback cb : mCallbacks) {
+                                cb.onFingerDown();
+                            }
+                        } else if (!mScreenOffPress) {
+                            mUltrasonicDown = false;
+                            for (Callback cb : mCallbacks) {
+                                cb.onFingerUp();
+                            }
                         }
                     });
                 } else {
                     mFgExecutor.execute(() -> {
+                        mUltrasonicDown = false;
+                        mScreenOffPress = false;
                         for (Callback cb : mCallbacks) {
                             cb.onFingerUp();
                         }
+                        // A tap too short to match ends here with no auth result.
+                        hideUdfpsAnimation();
                     });
                 }
             }
@@ -746,7 +834,8 @@ public class UdfpsController implements DozeReceiver, Dumpable {
             UserActivityNotifier userActivityNotifier,
             Lazy<WakefulnessLifecycle> wakefulnessLifecycle,
             MSDLPlayer msdlPlayer,
-            Lazy<SceneInteractor> sceneInteractorLazy) {
+            Lazy<SceneInteractor> sceneInteractorLazy,
+            @NonNull AuthController authController) {
         mContext = context;
         mExecution = execution;
         mVibrator = vibrator;
@@ -774,7 +863,8 @@ public class UdfpsController implements DozeReceiver, Dumpable {
         mSystemClock = systemClock;
         mLatencyTracker = latencyTracker;
         mActivityTransitionAnimator = activityTransitionAnimator;
-        mSensorProps = new FingerprintSensorPropertiesInternal(
+        final FingerprintSensorPropertiesInternal udfps = findFirstUdfps();
+        mSensorProps = udfps != null ? udfps : new FingerprintSensorPropertiesInternal(
                 -1 /* sensorId */,
                 SensorProperties.STRENGTH_CONVENIENCE,
                 0 /* maxEnrollmentsPerUser */,
@@ -803,6 +893,8 @@ public class UdfpsController implements DozeReceiver, Dumpable {
         mSceneInteractorLazy = sceneInteractorLazy;
 
         mDumpManager.registerDumpable(TAG, this);
+        
+        mAuthController = authController;
 
         mOrientationListener = new BiometricDisplayListener(
                 context,
@@ -836,6 +928,26 @@ public class UdfpsController implements DozeReceiver, Dumpable {
 
         mDisableSmartPixels = mContext.getResources().getBoolean(
                 com.android.systemui.res.R.bool.config_disableSmartPixelsOnUDFPS);
+
+        if (CustomUtils.isPackageInstalled(mContext,
+                "com.crdroid.udfps.animations")) {
+            mLastConfig.setTo(mContext.getResources().getConfiguration());
+            updateUdfpsAnimation();
+            mConfigurationController.addCallback(mConfigurationListener);
+        }
+    }
+
+    private void updateUdfpsAnimation() {
+        boolean isKeyguard = false;
+        if (mUdfpsAnimation != null) {
+            isKeyguard = mUdfpsAnimation.isKeyguard();
+            mUdfpsAnimation.removeAnimation();
+            mUdfpsAnimation = null;
+        }
+        mUdfpsAnimation = new UdfpsAnimation(mContext, mWindowManager, mSensorProps, mAuthController);
+        if (isKeyguard) {
+            mUdfpsAnimation.setIsKeyguard(true);
+        }
     }
 
     private void isSmartPixelsEnabled() {
@@ -880,6 +992,17 @@ public class UdfpsController implements DozeReceiver, Dumpable {
         }
     }
 
+    @Nullable
+    private FingerprintSensorPropertiesInternal findFirstUdfps() {
+        for (FingerprintSensorPropertiesInternal props :
+                mFingerprintManager.getSensorPropertiesInternal()) {
+            if (props.isAnyUdfpsType()) {
+                return props;
+            }
+        }
+        return null;
+    }
+
     @Override
     public void dozeTimeTick() {
 
@@ -903,6 +1026,14 @@ public class UdfpsController implements DozeReceiver, Dumpable {
 
         mOverlay = overlay;
         final int requestReason = overlay.getRequestReason();
+
+        if (mUdfpsAnimation != null) {
+            mUdfpsAnimation.setIsKeyguard(
+                    requestReason == REASON_AUTH_KEYGUARD
+                            || mKeyguardStateController.isShowing()
+                            || mStatusBarStateController.isDozing());
+        }
+
         if (requestReason == REASON_AUTH_KEYGUARD
                 && !mKeyguardUpdateMonitor.isFingerprintDetectionRunning()) {
             Log.d(TAG, "Attempting to showUdfpsOverlay when fingerprint detection"
@@ -930,6 +1061,11 @@ public class UdfpsController implements DozeReceiver, Dumpable {
                     BOOST_DURATION_TIMEOUT);
             mIsPerfLockAcquired = true;
         }
+
+        if (!mKeyguardCallbackRegistered) {
+            mKeyguardUpdateMonitor.registerCallback(mKeyguardCallback);
+            mKeyguardCallbackRegistered = true;
+        }
     }
 
     private void hideUdfpsOverlay() {
@@ -946,9 +1082,15 @@ public class UdfpsController implements DozeReceiver, Dumpable {
                     /* updateScrim */ true,
                     /* clearDismissAction */ false
             );
+            hideUdfpsAnimation();
             Log.v(TAG, "hideUdfpsOverlay | removing window: " + removed);
         } else {
             Log.v(TAG, "hideUdfpsOverlay | the overlay is already hidden");
+        }
+
+        if (mKeyguardCallbackRegistered) {
+            mKeyguardUpdateMonitor.removeCallback(mKeyguardCallback);
+            mKeyguardCallbackRegistered = false;
         }
 
         mOverlay = null;
@@ -1035,7 +1177,7 @@ public class UdfpsController implements DozeReceiver, Dumpable {
                 && Settings.Secure.getIntForUser(
                         mContext.getContentResolver(),
                         Settings.Secure.SCREEN_OFF_UNLOCK_UDFPS_ENABLED,
-                        0,
+                        mContext.getResources().getBoolean(R.bool.config_screen_off_udfps_default_on) ? 1 : 0,
                         mContext.getUserId()) != 0;
     }
 
@@ -1186,6 +1328,7 @@ public class UdfpsController implements DozeReceiver, Dumpable {
                 cb.onFingerDown();
             }
         }
+        showUdfpsAnimation();
     }
 
     private void onFingerUp(long requestId, @NonNull View view) {
@@ -1234,6 +1377,7 @@ public class UdfpsController implements DozeReceiver, Dumpable {
                     cb.onFingerUp();
                 }
             }
+            hideUdfpsAnimation();
         }
         mOnFingerDown = false;
         unconfigureDisplay(view);
@@ -1242,6 +1386,27 @@ public class UdfpsController implements DozeReceiver, Dumpable {
         if (mPerf != null && mIsPerfLockAcquired) {
             mPerf.perfLockRelease();
             mIsPerfLockAcquired = false;
+        }
+    }
+
+    public boolean isAnimationEnabled() {
+        return mUdfpsAnimation != null && mUdfpsAnimation.isAnimationEnabled();
+    }
+
+    /** Whether the current press came with the screen off or on AOD. */
+    public boolean isScreenOffPress() {
+        return mScreenOffPress;
+    }
+
+    private void showUdfpsAnimation() {
+        if (mUdfpsAnimation != null) {
+            mUdfpsAnimation.show();
+        }
+    }
+
+    private void hideUdfpsAnimation() {
+        if (mUdfpsAnimation != null) {
+            mUdfpsAnimation.hide();
         }
     }
 

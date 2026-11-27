@@ -37,6 +37,9 @@ import android.graphics.RectF;
 import android.graphics.RenderEffect;
 import android.graphics.Shader;
 import android.os.Trace;
+import android.database.ContentObserver;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.UserHandle;
 import android.provider.Settings;
 import android.service.notification.StatusBarNotification;
@@ -224,6 +227,14 @@ public class NotificationStackScrollLayoutController implements Dumpable {
     private final NotificationListContainerImpl mNotificationListContainer =
             new NotificationListContainerImpl();
 
+    private final ContentObserver mGlassObserver =
+            new ContentObserver(new Handler(Looper.getMainLooper())) {
+                @Override
+                public void onChange(boolean selfChange) {
+                    mView.updateDecorViews();
+                }
+            };
+
     @VisibleForTesting
     final View.OnAttachStateChangeListener mOnAttachStateChangeListener =
             new View.OnAttachStateChangeListener() {
@@ -231,6 +242,13 @@ public class NotificationStackScrollLayoutController implements Dumpable {
                 public void onViewAttachedToWindow(View v) {
                     mColorUpdateLogger.logTriggerEvent("NSSLC.onViewAttachedToWindow()");
                     mConfigurationController.addCallback(mConfigurationListener);
+                    for (String key : new String[] {"penguin_liquid_glass",
+                            CosFeature.ALL, CosFeature.Shade.getKey()}) {
+                        mView.getContext().getContentResolver().registerContentObserver(
+                                Settings.Secure.getUriFor(key), false, mGlassObserver,
+                                UserHandle.USER_ALL);
+                    }
+                    mView.updateDecorViews();
                     final int newBarState = mStatusBarStateController.getState();
                     if (newBarState != mBarState) {
                         mStateListener.onStateChanged(newBarState);
@@ -244,6 +262,8 @@ public class NotificationStackScrollLayoutController implements Dumpable {
                 public void onViewDetachedFromWindow(View v) {
                     mColorUpdateLogger.logTriggerEvent("NSSLC.onViewDetachedFromWindow()");
                     mConfigurationController.removeCallback(mConfigurationListener);
+                    mView.getContext().getContentResolver()
+                            .unregisterContentObserver(mGlassObserver);
                     mStatusBarStateController.removeCallback(mStateListener);
                 }
             };
@@ -962,10 +982,11 @@ public class NotificationStackScrollLayoutController implements Dumpable {
         mTouchHandler = new TouchHandler();
         mView.setTouchHandler(mTouchHandler);
         mView.setResetUserExpandedStatesRunnable(mNotificationsController::resetUserExpandedStates);
-        // Cards opened in the expanded lock screen stack fold back with it.
+        // Cards opened in the expanded lock screen stack fold back with it. Groups first:
+        // collapseGroups() only collapses user expanded groups, which the reset would clear.
         LockscreenStack.addCollapseListener(() -> mView.post(() -> {
-            mNotificationsController.resetUserExpandedStates();
             mGroupExpansionManager.collapseGroups();
+            mNotificationsController.resetUserExpandedStates();
         }));
         mView.setClearAllAnimationListener(this::onAnimationEnd);
         mView.setClearAllListener((selection) -> mUiEventLogger.log(

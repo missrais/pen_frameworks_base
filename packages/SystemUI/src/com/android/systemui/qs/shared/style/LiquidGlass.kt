@@ -81,9 +81,41 @@ import kotlinx.coroutines.launch
 object LiquidGlass {
     private const val SETTING = "penguin_liquid_glass"
     private const val STYLE_SETTING = "penguin_liquid_glass_style"
+    private const val DUAL_TONE_SETTING = "penguin_liquid_glass_dual_tone"
 
     private var state: State<Boolean>? = null
     private var cosState: State<Boolean>? = null
+    private var dualToneState: State<Boolean>? = null
+
+    /** Penguin Laboratory's dual-tone shade switch for Liquid Glass. */
+    fun dualTone(context: Context): State<Boolean> =
+        dualToneState
+            ?: synchronized(this) {
+                dualToneState
+                    ?: run {
+                        val resolver = context.applicationContext.contentResolver
+                        val read = {
+                            Settings.Secure.getIntForUser(
+                                resolver,
+                                DUAL_TONE_SETTING,
+                                0,
+                                UserHandle.USER_CURRENT,
+                            ) == 1
+                        }
+                        val value = mutableStateOf(read())
+                        resolver.registerContentObserver(
+                            Settings.Secure.getUriFor(DUAL_TONE_SETTING),
+                            false,
+                            object : ContentObserver(Handler(Looper.getMainLooper())) {
+                                override fun onChange(selfChange: Boolean) {
+                                    value.value = read()
+                                }
+                            },
+                            UserHandle.USER_ALL,
+                        )
+                        value.also { dualToneState = it }
+                    }
+            }
 
     fun cosStyle(context: Context): State<Boolean> =
         cosState
@@ -142,6 +174,13 @@ object LiquidGlass {
 
     @JvmStatic fun isEnabled(context: Context): Boolean = enabled(context).value
 
+    /**
+     * Whether the shade's header and empty-shade text are white in the light theme too:
+     * iOS and ColorOS both draw them white over their glass.
+     */
+    @JvmStatic
+    fun whiteShadeContent(context: Context): Boolean = isEnabled(context)
+
     @JvmStatic
     fun notificationGap(res: Resources, default: Int): Int =
         if (state?.value == true) (NOTIFICATION_GAP_DP * res.displayMetrics.density).roundToInt()
@@ -149,7 +188,7 @@ object LiquidGlass {
 
     private const val NOTIFICATION_GAP_DP = 8
 
-    @JvmStatic fun viewSurface(): Int = LiquidGlassTune.color("view_surface", 0x1CFFFFFF)
+    @JvmStatic fun viewSurface(): Int = LiquidGlassTune.color("view_surface", 0x59121216)
 
     @JvmStatic
     fun headsUpSurface(): Int = LiquidGlassTune.color("headsup_surface", 0x33FFFFFF)
@@ -551,6 +590,8 @@ private class GlassRimNode(private var shape: Shape, private var strength: Float
 
     override fun ContentDrawScope.draw() {
         val generation = LiquidGlassTune.generation.value
+        // Shapes such as the QS tile shape animate their radius without changing identity.
+        val corner = shape.simpleCornerRadius(size, Density(density, fontScale), layoutDirection)
         val cached = rim
         val r =
             if (
@@ -558,7 +599,8 @@ private class GlassRimNode(private var shape: Shape, private var strength: Float
                     cached.size == size &&
                     cached.density == density &&
                     cached.layoutDirection == layoutDirection &&
-                    cached.generation == generation
+                    cached.generation == generation &&
+                    cached.corner == corner
             ) {
                 cached
             } else {
@@ -581,6 +623,7 @@ private class GlassRim(
     val density = densityScope.density
     private val bounds = RectF(0f, 0f, size.width, size.height)
     private val glowRound = shape.simpleCornerRadius(size, densityScope, layoutDirection)
+    val corner = glowRound
     private val edge by lazy { shape.toPath(size, densityScope, layoutDirection).asAndroidPath() }
     // Rounded shapes of one size differ only by their radius; anything else hashes its outline.
     private val glowShape =
@@ -727,6 +770,7 @@ private suspend fun androidx.compose.ui.input.pointer.PointerInputScope.trackGla
                     } ?: continue
                 if (!accept(down.position)) continue
                 launch { lift.animateTo(1f, PressSpring) }
+                var dragged = false
                 while (true) {
                     val event = awaitPointerEvent(PointerEventPass.Initial)
                     val change = event.changes.firstOrNull { it.id == down.id } ?: break
@@ -734,6 +778,11 @@ private suspend fun androidx.compose.ui.input.pointer.PointerInputScope.trackGla
                     val d = change.position - down.position
                     val reach = 10.dp.toPx()
                     val dist = hypot(d.x, d.y)
+                    // A drag scrolls or pulls the shade; let go of the press there.
+                    if (dist > viewConfiguration.touchSlop) {
+                        dragged = true
+                        break
+                    }
                     val pull =
                         if (dist == 0f) 0f
                         else reach * (1f - 1f / (1f + dist / (reach * 3f))) / dist
@@ -741,6 +790,11 @@ private suspend fun androidx.compose.ui.input.pointer.PointerInputScope.trackGla
                 }
                 launch { lift.animateTo(0f, releaseSpring()) }
                 launch { lean.animateTo(Offset.Zero, releaseSpring()) }
+                while (dragged) {
+                    val event = awaitPointerEvent(PointerEventPass.Initial)
+                    val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                    if (!change.pressed) break
+                }
             }
         }
     }

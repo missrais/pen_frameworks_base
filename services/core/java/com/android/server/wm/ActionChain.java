@@ -178,7 +178,11 @@ public class ActionChain {
     private Transition expectCollecting() {
         final Transition transition = getTransition();
         if (transition == null) {
-            Slog.e(TAG, "Can't collect into a chain with no transition");
+            // Without tracker plumbing this is the controller's collecting transition, which
+            // is legitimately absent between transitions.
+            if (Flags.transitTrackerPlumbing()) {
+                Slog.e(TAG, "Can't collect into a chain with no transition");
+            }
             return null;
         }
         if (isFinishing()) {
@@ -213,6 +217,7 @@ public class ActionChain {
     void collectClose(@NonNull WindowContainer<?> wc) {
         if (!wc.mTransitionController.isShellTransitionsEnabled()) return;
         final Transition transition = expectCollecting();
+        if (transition == null) return;
         if (Transition.allowsInvisibleExistenceChange(wc) || wc.isVisibleRequested()) {
             transition.collectExistenceChange(wc);
         } else {

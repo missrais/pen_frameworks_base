@@ -22,6 +22,7 @@ import static com.android.systemui.Flags.physicalNotificationMovement;
 import static com.android.systemui.util.ColorUtilKt.hexColorString;
 
 import android.content.Context;
+import android.graphics.Color;
 import android.content.res.Configuration;
 import android.content.res.Resources;
 import android.graphics.Rect;
@@ -268,8 +269,10 @@ public class NotificationShelf extends ActivatableNotificationView {
                 viewState.notGoneIndex = Math.min(viewState.notGoneIndex, mNotGoneIndex);
             }
 
+            // Penguin: the lock screen pill stays on the ambient display, so minimised
+            // notifications show there too; AOSP hid the shelf for every pulse.
             viewState.hidden = !mAmbientState.isShadeExpanded()
-                    || mAmbientState.isPulsing()
+                    || (mAmbientState.isPulsing() && !mAmbientState.isOnKeyguard())
                     || algorithmState.firstViewInShelf == null
                     || (mAmbientState.isOnKeyguard() && mDisableNotificationShelfOnKeyguard)
                     // The lock screen stack expanded in place scrolls instead.
@@ -627,6 +630,10 @@ public class NotificationShelf extends ActivatableNotificationView {
 
         // TODO(b/172289889) transition last icon in shelf to notification icon and vice versa.
         setVisibility(isHidden ? View.INVISIBLE : View.VISIBLE);
+        // The lock screen pill is glass over the wallpaper, so its icons stay white there.
+        mShelfIcons.setForcedOverrideIconColor(
+                mAmbientState.isOnKeyguard() && LiquidGlass.isEnabled(getContext())
+                        ? Color.WHITE : 0);
         mShelfIcons.calculateIconXTranslations();
         mShelfIcons.applyIconStates();
         for (int i = 0; i < getHostLayoutChildCount(); i++) {

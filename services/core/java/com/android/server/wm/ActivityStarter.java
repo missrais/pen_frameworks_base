@@ -163,6 +163,7 @@ import com.android.server.power.ShutdownCheckPoints;
 import com.android.server.statusbar.StatusBarManagerInternal;
 import com.android.server.uri.NeededUriGrants;
 import com.android.server.wm.ActivityMetricsLogger.LaunchingState;
+import com.android.server.obscura.ObscuraService;
 import com.android.server.wm.BackgroundActivityStartController.BalVerdict;
 import com.android.server.wm.LaunchParamsController.LaunchParams;
 import com.android.server.wm.TaskFragment.EmbeddingCheckResult;
@@ -440,6 +441,17 @@ class ActivityStarter {
         String intentCreatorPackage;
         int startFlags;
         SafeActivityOptions activityOptions;
+        /**
+         * Set to {@code true} for system-delegated activity launches (such as {@link
+         * ActivityTaskManagerService#startActivityAsCaller}) or internal system UI redirects (such
+         * as rerouting to {@link HeavyWeightSwitcherActivity} in {@link
+         * #resolveToHeavyWeightSwitcherIfNeeded}) to bypass target component permission and
+         * exported checks in {@link ActivityTaskSupervisor#checkStartAnyActivityPermission}.
+         *
+         * <p>Note: this field has no effect on Background Activity Launch (BAL) evaluation or
+         * Intent Firewall enforcements. Its scope should not be expanded without carefully
+         * reviewing all security implications and use cases.
+         */
         boolean ignoreTargetSecurity;
         boolean componentSpecified;
         boolean avoidMoveToFront;
@@ -922,6 +934,21 @@ class ActivityStarter {
 
                 final long origId = Binder.clearCallingIdentity();
                 try {
+                    if (mRequest.intent != null && mRequest.intent.getComponent() != null) {
+                        String targetPkg = mRequest.intent.getComponent().getPackageName();
+                        String callerPkg = mRequest.callingPackage;
+                        if (targetPkg != null
+                                && callerPkg != null
+                                && !targetPkg.equals(callerPkg)
+                                && ObscuraService.get().shouldHidePackageFromCaller(callerPkg, targetPkg,
+                                        UserHandle.getUserId(mRequest.callingUid))) {
+                            int callerUid = mRequest.callingUid;
+                            if (callerUid != android.os.Process.SYSTEM_UID
+                                    && callerUid != android.os.Process.ROOT_UID) {
+                                return ActivityManager.START_CLASS_NOT_FOUND;
+                            }
+                        }
+                    }
                     res = resolveToHeavyWeightSwitcherIfNeeded();
                     if (res != START_SUCCESS) {
                         return res;
@@ -1025,10 +1052,13 @@ class ActivityStarter {
         }
 
         int appCallingUid = mRequest.callingUid;
+        int appCallingPid = mRequest.callingPid;
         if (mRequest.caller != null) {
-            WindowProcessController callerApp = mService.getProcessController(mRequest.caller);
+            final WindowProcessController callerApp =
+                    mService.getProcessController(mRequest.caller);
             if (callerApp != null) {
                 appCallingUid = callerApp.mUid;
+                appCallingPid = callerApp.getPid();
             } else {
                 Slog.w(TAG, "Unable to find app for caller " + mRequest.caller + " (pid="
                         + mRequest.callingPid + ") when starting: " + mRequest.intent.toString());
@@ -1060,8 +1090,11 @@ class ActivityStarter {
         mRequest.intent = newIntent;
         mRequest.resolvedType = null;
         mRequest.caller = null;
-        mRequest.callingUid = Binder.getCallingUid();
-        mRequest.callingPid = Binder.getCallingPid();
+        // Preserve original calling UID/PID for BAL evaluation and ignore target security to
+        // permit starting the non-exported system activity in checkStartAnyActivityPermission.
+        mRequest.callingUid = appCallingUid;
+        mRequest.callingPid = appCallingPid;
+        mRequest.ignoreTargetSecurity = true;
         mRequest.componentSpecified = true;
         mRequest.resolveInfo = mSupervisor.resolveIntent(mRequest.intent, null /* resolvedType */,
                 mRequest.userId, 0 /* matchFlags */,

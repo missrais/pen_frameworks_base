@@ -46,6 +46,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.android.compose.animation.scene.ContentScope
 import com.android.compose.animation.scene.OverlayKey
 import com.android.compose.animation.scene.content.state.TransitionState
@@ -77,6 +78,7 @@ import com.android.systemui.qs.shared.style.liquidGlassEnabled
 import com.android.systemui.scene.shared.model.Overlays
 import com.android.systemui.scene.shared.model.Scenes
 import com.android.systemui.scene.ui.composable.transitions.LockscreenToGoneCosFadeEnd
+import com.android.systemui.statusbar.phone.DozeParameters
 import kotlin.math.max
 import kotlin.math.min
 import kotlinx.coroutines.flow.first
@@ -99,6 +101,7 @@ class LockscreenContent(
     private val player: LockscreenPlayer? = null,
     private val clockFace: LockscreenClockFace? = null,
     private val expandedStack: LockscreenExpandedStack? = null,
+    private val dozeParameters: DozeParameters? = null,
 ) {
     @Composable
     fun ContentScope.Content(modifier: Modifier = Modifier) {
@@ -194,6 +197,9 @@ class LockscreenContent(
         val covered = { overlaid { true } }
         val shaded = { overlaid { it != Overlays.Bouncer } }
         val glass = liquidGlassEnabled()
+        // Only the fingerprint icon stays on the dozing screen when AOD itself is off.
+        val udfpsIconOnly = dozeParameters?.udfpsIconOnly?.collectAsStateWithLifecycle()
+        val aodContent = { if (udfpsIconOnly?.value == true) 0f else 1f }
         val fluidClock = clockFace?.isEnabled == true
         val cosUnlock = clockFace?.cosUnlock == true
         val screenCorner = LocalScreenCornerRadius.current
@@ -211,7 +217,8 @@ class LockscreenContent(
             (toGone ?: overlaid { it == Overlays.Bouncer }).coerceIn(0f, 1f)
         }
         // The stack fades out in the first half of folding into the now bar, and is back in full
-        // as soon as the shade or bouncer covers the lock screen or the lock screen is left.
+        // as soon as the shade covers the lock screen or the lock screen is left. The glass
+        // bouncer is see-through, so the stack fades out under it instead.
         DisposableEffect(Unit) { onDispose { NowBarStack.alpha.value = 1f } }
         LaunchedEffect(Unit) {
             snapshotFlow {
@@ -220,8 +227,8 @@ class LockscreenContent(
                         (layoutState.currentTransition as? TransitionState.Transition.ChangeScene)
                             ?.takeIf { it.fromContent == contentKey }
                             ?.progress ?: 0f
-                    val away = max(covered(), leaving.coerceIn(0f, 1f))
-                    fold + (1f - fold) * away
+                    val away = max(shaded(), leaving.coerceIn(0f, 1f))
+                    (fold + (1f - fold) * away) * (1f - overlaid { it == Overlays.Bouncer })
                 }
                 .collect { NowBarStack.alpha.value = it }
         }
@@ -250,7 +257,7 @@ class LockscreenContent(
                         transition.toContent == contentKey -> transition.progress
                         else -> 1f
                     }.coerceIn(0f, 1f)
-                min(viewModel.alpha, contentAlphaAnimatable.value) * sceneAlpha
+                min(viewModel.alpha, contentAlphaAnimatable.value) * sceneAlpha * aodContent()
             },
             covered = covered,
             unlocking = { if (glass) unlocking() else 0f },
@@ -293,7 +300,8 @@ class LockscreenContent(
                     Modifier.graphicsLayer {
                         alpha =
                             min(viewModel.alpha, contentAlphaAnimatable.value) *
-                                (if (glass) 1f - shaded() else 1f)
+                                (if (glass) 1f - shaded() else 1f) *
+                                aodContent()
                     }
                 )
             }
@@ -304,7 +312,8 @@ class LockscreenContent(
                 alpha = {
                     min(viewModel.alpha, contentAlphaAnimatable.value) *
                         (1f - covered()) *
-                        (1f - LockscreenStack.clockCover)
+                        (1f - LockscreenStack.clockCover) *
+                        aodContent()
                 },
                 unlocking = toGone,
             )

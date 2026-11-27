@@ -1756,6 +1756,10 @@ final class InstallPackageHelper {
 
         String pkgName = parsedPackage.getPackageName();
         request.setName(pkgName);
+        if (mPm.isPackageDeviceAdmin(pkgName, request.getUserId()) && onExternal) {
+            throw new PrepareFailure(INSTALL_FAILED_INVALID_INSTALL_LOCATION,
+                    "Device Admin can only be installed on internal storage.");
+        }
         if (parsedPackage.isTestOnly()) {
             if ((installFlags & PackageManager.INSTALL_ALLOW_TEST) == 0) {
                 throw new PrepareFailure(INSTALL_FAILED_TEST_ONLY,
@@ -4772,6 +4776,13 @@ final class InstallPackageHelper {
         }
     }
 
+    /** Installed from adb, not by an installer app. */
+    private static boolean isShellInstall(@NonNull InstallSource installSource) {
+        return installSource.mInstallerPackageName == null
+                && PackageManagerService.SHELL_PACKAGE_NAME.equals(
+                        installSource.mInitiatingPackageName);
+    }
+
     private Pair<ScanResult, Boolean> scanPackageForInitLI(ParsedPackage parsedPackage,
             @ParsingPackageUtils.ParseFlags int parseFlags,
             @PackageManagerService.ScanFlags int scanFlags,
@@ -4844,8 +4855,14 @@ final class InstallPackageHelper {
             final boolean newSharedUserSetting = pkgAlreadyExists
                     && (initialScanRequest.mOldSharedUserSetting
                     != initialScanRequest.mSharedUserSetting);
+            // An adb install of a system app is a development override: drop it once a new
+            // build brings that app at the same or a later version.
+            final boolean isStaleShellUpdate = isUpgrade && pkgAlreadyExists
+                    && isShellInstall(pkgSetting.getInstallSource())
+                    && parsedPackage.getLongVersionCode() >= pkgSetting.getVersionCode();
             final boolean isSystemPkgBetter = scanSystemPartition && isSystemPkgUpdated
-                    && newPkgChangedPaths && (newPkgVersionGreater || newSharedUserSetting);
+                    && newPkgChangedPaths
+                    && (newPkgVersionGreater || newSharedUserSetting || isStaleShellUpdate);
             if (isSystemPkgBetter) {
                 // The version of the application on /system is greater than the version on
                 // /data. Switch back to the application on /system.

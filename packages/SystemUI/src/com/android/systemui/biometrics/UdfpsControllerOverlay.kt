@@ -300,7 +300,11 @@ constructor(
             listenForCurrentKeyguardState?.cancel()
             listenForCurrentKeyguardState =
                 scope.launch {
-                    currentStateUpdatedToOffAodDozingOrDreaming.collect { addViewIfPending() }
+                    merge(
+                            currentStateUpdatedToOffAodDozingOrDreaming,
+                            powerInteractor.detailedWakefulness.filter { it.isAwake() }.map {},
+                        )
+                        .collect { addViewIfPending() }
                 }
         }
     }
@@ -315,8 +319,8 @@ constructor(
 
     fun updateOverlayParams(updatedOverlayParams: UdfpsOverlayParams) {
         overlayParams = updatedOverlayParams
-        sensorBounds = updatedOverlayParams.sensorBounds
-        overlayTouchView?.sensorRect = updatedOverlayParams.sensorBounds
+        sensorBounds = Rect(updatedOverlayParams.sensorBounds)
+        overlayTouchView?.sensorRect = sensorBounds
         getTouchOverlay()?.let {
             if (addViewRunnable == null) {
                 // Only updateViewLayout if there's no pending view to add to WM.
@@ -439,8 +443,9 @@ constructor(
             return true
         }
 
-        // on the keyguard, make sure we don't rotate if we're going to sleep or not occluded
-        return !(keyguardUpdateMonitor.isGoingToSleep || !keyguardStateController.isOccluded)
+        // The keyguard can rotate too; keep its touch overlay aligned with the display.
+        // Avoid changing orientation during the transition to sleep.
+        return !keyguardUpdateMonitor.isGoingToSleep
     }
 }
 

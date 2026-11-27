@@ -33,6 +33,7 @@ import com.android.app.tracing.coroutines.launchTraced as launch
 import com.android.internal.graphics.drawable.BackgroundBlurDrawable
 import com.android.systemui.Flags
 import com.android.systemui.Flags.enableLockscreenBlur
+import com.android.systemui.biometrics.UdfpsIconPack
 import com.android.systemui.common.ui.view.BackgroundBlurAlphaSync
 import com.android.systemui.common.ui.view.TouchHandlingView
 import com.android.systemui.keyguard.ui.view.DeviceEntryIconView
@@ -80,6 +81,9 @@ object DeviceEntryIconViewBinder {
         msdlPlayer: MSDLPlayer,
         overrideColor: Color? = null,
     ): DisposableHandle {
+        val packageInstalled = UdfpsIconPack.isInstalled(view.context)
+        val shouldUseCustomUdfpsIcon = UdfpsIconPack.customIconSelected(applicationScope)
+
         val disposables = DisposableHandles()
         val touchHandlingView = view.touchHandlingView
         val fgIconView = view.iconView
@@ -121,7 +125,7 @@ object DeviceEntryIconViewBinder {
                 if (height <= 0 || width <= 0) {
                     return@OnLayoutChangeListener
                 }
-                if (height == oldBottom - oldTop && width == oldLeft - oldRight) {
+                if (height == oldBottom - oldTop && width == oldRight - oldLeft) {
                     return@OnLayoutChangeListener
                 }
                 v?.background?.let {
@@ -136,10 +140,19 @@ object DeviceEntryIconViewBinder {
                 repeatOnLifecycle(Lifecycle.State.CREATED) {
                     launch("$TAG#viewModel.useBackgroundProtection") {
                         viewModel.useBackgroundProtection.collect { useBackgroundProtection ->
-                            if (useBackgroundProtection) {
-                                bgView.visibility = View.VISIBLE
-                            } else {
+                            if (shouldUseCustomUdfpsIcon.value && packageInstalled) {
                                 bgView.visibility = View.GONE
+                            } else {
+                                bgView.visibility = if (useBackgroundProtection) View.VISIBLE else View.GONE
+                            }
+                        }
+                    }
+                    launch("$TAG#shouldUseCustomUdfpsIcon") {
+                        shouldUseCustomUdfpsIcon.collect { useCustomIcon ->
+                            if (useCustomIcon && packageInstalled) {
+                                bgView.visibility = View.GONE
+                            } else {
+                                bgView.visibility = if (viewModel.useBackgroundProtection.value) View.VISIBLE else View.GONE
                             }
                         }
                     }
@@ -259,12 +272,16 @@ object DeviceEntryIconViewBinder {
                             }
                             fgIconView.imageTintList =
                                 ColorStateList.valueOf(overrideColor?.toArgb() ?: viewModel.tint)
-                            fgIconView.setPadding(
-                                viewModel.padding,
-                                viewModel.padding,
-                                viewModel.padding,
-                                viewModel.padding,
-                            )
+                            if (!view.usesCustomUdfpsIcon(viewModel.type)) {
+                                fgIconView.setPadding(
+                                    viewModel.padding,
+                                    viewModel.padding,
+                                    viewModel.padding,
+                                    viewModel.padding
+                                )
+                            } else {
+                                fgIconView.setPadding(0, 0, 0, 0)
+                            }
                             // Set image state at the end after updating other view state. This
                             // method forces the ImageView to recompute the bounds of the drawable.
                             fgIconView.setImageState(
@@ -328,7 +345,14 @@ object DeviceEntryIconViewBinder {
                             ) { color, cos ->
                                 if (cos) android.graphics.Color.TRANSPARENT else color
                             }
-                            .collect { color -> bgView.imageTintList = ColorStateList.valueOf(color) }
+                            .collect { color ->
+                                bgView.imageTintList =
+                                    if (!shouldUseCustomUdfpsIcon.value || !packageInstalled) {
+                                        ColorStateList.valueOf(color)
+                                    } else {
+                                        null
+                                    }
+                            }
                     }
                 }
             }

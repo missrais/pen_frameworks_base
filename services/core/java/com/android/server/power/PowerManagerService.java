@@ -72,6 +72,7 @@ import android.hardware.display.DisplayManager;
 import android.hardware.display.DisplayManagerInternal;
 import android.hardware.power.Boost;
 import android.hardware.power.Mode;
+import android.net.TrafficStats;
 import android.net.Uri;
 import android.os.BatteryManager;
 import android.os.BatteryManagerInternal;
@@ -119,8 +120,12 @@ import android.util.KeyValueListParser;
 import android.util.LongArray;
 import android.util.PrintWriterPrinter;
 import android.util.Slog;
+import android.app.ActivityManagerInternal;
+import android.content.pm.ServiceInfo;
+import com.android.server.LocalServices;
 import android.util.SparseArray;
 import android.util.SparseBooleanArray;
+import android.util.SparseLongArray;
 import android.util.SparseIntArray;
 import android.util.TimeUtils;
 import android.util.proto.ProtoOutputStream;
@@ -205,6 +210,29 @@ public final class PowerManagerService extends SystemService
 
     // Message: Sent when the policy wants to force disable wakelocks.
     private static final int MSG_FORCE_DISABLE_WAKELOCKS = 8;
+
+    // Penguin: re-checks foreground service wake locks while the device is in deep idle.
+    private static final int MSG_DOZE_WAKELOCK_GUARD = 9;
+
+    /** Settings.Global key for the Doze wake lock guard (Laboratory > System > Battery). */
+    private static final String DOZE_WAKELOCK_GUARD_SETTING = "penguin_doze_wakelock_guard";
+    private static final long DOZE_GUARD_CHECK_INTERVAL_MS = 60 * 1000L;
+    /** A foreground service has to be idle this long in deep idle before its wake lock goes. */
+    private static final long DOZE_GUARD_QUIET_MS = 5 * 60 * 1000L;
+    /** Bytes moved within one check interval that count as an active transfer. */
+    private static final long DOZE_GUARD_ACTIVE_BYTES = 64 * 1024L;
+    /** Foreground service types whose wake locks are always kept: they are time critical. */
+    private static final int DOZE_GUARD_KEEP_TYPES =
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+            | ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL
+            | ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            | ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            | ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            | ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+            | ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            | ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH
+            | ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING
+            | ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED;
 
     // Dirty bit: mWakeLocks changed
     private static final int DIRTY_WAKE_LOCKS = 1 << 0;
@@ -326,6 +354,16 @@ public final class PowerManagerService extends SystemService
 
     private final Context mContext;
     private final ServiceThread mHandlerThread;
+    // Penguin Doze wake lock guard. mDozeGuardBlockedUids is guarded by mLock; the byte and
+    // quiet-time maps are only touched on mHandler, which never holds mLock while it asks
+    // ActivityManager or netstats (both call into this service under their own locks).
+    @GuardedBy("mLock")
+    private boolean mDozeWakeLockGuardEnabled = true;
+    @GuardedBy("mLock")
+    private final SparseBooleanArray mDozeGuardBlockedUids = new SparseBooleanArray();
+    private final SparseLongArray mDozeGuardLastBytes = new SparseLongArray();
+    private final SparseLongArray mDozeGuardQuietSince = new SparseLongArray();
+
     private final Handler mHandler;
     private final AmbientDisplayConfiguration mAmbientDisplayConfiguration;
     @Nullable
@@ -747,6 +785,10 @@ public final class PowerManagerService extends SystemService
 
     // True if double tap to wake is enabled
     private boolean mDoubleTapEnabled;
+    // Penguin: the screen-off single tap (doze tap sensor) is on; double tap to wake is held off
+    // then, as the panel can't tell the two apart.
+    private boolean mScreenOffTapEnabled;
+    private boolean mSupportsScreenOffTapConfig;
     private boolean mSingleTapEnabled;
     private boolean mDrawVEnabled;
     private boolean mDrawInverseVEnabled;
@@ -1623,6 +1665,9 @@ public final class PowerManagerService extends SystemService
         resolver.registerContentObserver(Settings.Secure.getUriFor(
                 Settings.Secure.SCREENSAVER_ENABLED),
                 false, mSettingsObserver, UserHandle.USER_ALL);
+        resolver.registerContentObserver(Settings.Global.getUriFor(
+                DOZE_WAKELOCK_GUARD_SETTING),
+                false, mSettingsObserver, UserHandle.USER_ALL);
         resolver.registerContentObserver(Settings.Secure.getUriFor(
                 Settings.Secure.SCREENSAVER_ACTIVATE_ON_SLEEP),
                 false, mSettingsObserver, UserHandle.USER_ALL);
@@ -1670,6 +1715,9 @@ public final class PowerManagerService extends SystemService
                 false, mSettingsObserver, UserHandle.USER_ALL);
         resolver.registerContentObserver(Settings.System.getUriFor(
                 Settings.System.GESTURE_DOUBLE_TAP),
+                false, mSettingsObserver, UserHandle.USER_ALL);
+        resolver.registerContentObserver(Settings.Secure.getUriFor(
+                Settings.Secure.DOZE_TAP_SCREEN_GESTURE),
                 false, mSettingsObserver, UserHandle.USER_ALL);
         resolver.registerContentObserver(Settings.System.getUriFor(
                 Settings.System.GESTURE_SINGLE_TAP),
@@ -1803,6 +1851,8 @@ public final class PowerManagerService extends SystemService
                 com.android.internal.R.bool.config_brightWhenDozing);
         mSupportsDoubleTapConfig = resources.getInteger(
                 com.android.internal.R.integer.config_doubleTapKeyCode) > 0;
+        mSupportsScreenOffTapConfig = !android.text.TextUtils.isEmpty(resources.getString(
+                com.android.internal.R.string.config_dozeTapSensorType));
         mSupportsSingleTapConfig = resources.getInteger(
                 com.android.internal.R.integer.config_singleTapKeyCode) > 0;
         mSupportsDrawVConfig = resources.getInteger(
@@ -1836,6 +1886,13 @@ public final class PowerManagerService extends SystemService
     @GuardedBy("mLock")
     private void updateSettingsLocked() {
         final ContentResolver resolver = mContext.getContentResolver();
+
+        final boolean dozeGuard = Settings.Global.getInt(resolver,
+                DOZE_WAKELOCK_GUARD_SETTING, 1) != 0;
+        if (dozeGuard != mDozeWakeLockGuardEnabled) {
+            mDozeWakeLockGuardEnabled = dozeGuard;
+            scheduleDozeWakeLockGuardLocked(0);
+        }
 
         mDreamsEnabledSetting = (Settings.Secure.getIntForUser(resolver,
                 Settings.Secure.SCREENSAVER_ENABLED,
@@ -1882,10 +1939,19 @@ public final class PowerManagerService extends SystemService
                     Settings.System.GESTURE_DOUBLE_TAP, mContext.getResources()
                     .getInteger(com.android.internal.R.integer.config_doubleTapDefault),
                     UserHandle.USER_CURRENT) > 0;
-            if (doubleTapEnabled != mDoubleTapEnabled) {
+            final boolean screenOffTapEnabled = mSupportsScreenOffTapConfig
+                    && Settings.Secure.getIntForUser(resolver,
+                            Settings.Secure.DOZE_TAP_SCREEN_GESTURE,
+                            mContext.getResources().getBoolean(
+                                    com.android.internal.R.bool.config_dozeTapGestureEnabled)
+                                    ? 1 : 0,
+                            UserHandle.USER_CURRENT) != 0;
+            if (doubleTapEnabled != mDoubleTapEnabled
+                    || screenOffTapEnabled != mScreenOffTapEnabled) {
                 mDoubleTapEnabled = doubleTapEnabled;
+                mScreenOffTapEnabled = screenOffTapEnabled;
                 mNativeWrapper.nativeSetParanoidFeature(POWER_FEATURE_DOUBLE_TAP,
-                        mDoubleTapEnabled && mGesturesEnabled ? 1 : 0);
+                        mDoubleTapEnabled && mGesturesEnabled && !mScreenOffTapEnabled ? 1 : 0);
             }
         }
 
@@ -4905,8 +4971,12 @@ public final class PowerManagerService extends SystemService
                 return false;
             }
             mDeviceIdleMode = enabled;
+            if (!enabled) {
+                mDozeGuardBlockedUids.clear();
+            }
             updateWakeLockDisabledStatesLocked();
             setPowerModeInternal(MODE_DEVICE_IDLE, mDeviceIdleMode || mLightDeviceIdleMode);
+            scheduleDozeWakeLockGuardLocked(enabled ? DOZE_GUARD_CHECK_INTERVAL_MS : 0);
         }
         if (enabled) {
             EventLogTags.writeDeviceIdleOnPhase("power");
@@ -5129,6 +5199,109 @@ public final class PowerManagerService extends SystemService
     }
 
     @GuardedBy("mLock")
+    private void scheduleDozeWakeLockGuardLocked(long delayMs) {
+        mHandler.removeMessages(MSG_DOZE_WAKELOCK_GUARD);
+        mHandler.sendEmptyMessageDelayed(MSG_DOZE_WAKELOCK_GUARD, delayMs);
+    }
+
+    /**
+     * Penguin: in deep idle, Doze ignores the partial wake locks of most apps, but not those of
+     * apps running a foreground service. An idle one (for example a download manager waiting for
+     * its UI to come back) can then keep the device out of suspend all night. Release those after
+     * DOZE_GUARD_QUIET_MS without network traffic, unless the service type is time critical or
+     * the app is on the battery optimization allowlist. Runs on mHandler without mLock held.
+     */
+    private void handleDozeWakeLockGuard() {
+        final IntArray candidates = new IntArray();
+        synchronized (mLock) {
+            if (!mDeviceIdleMode || !mDozeWakeLockGuardEnabled) {
+                final boolean hadBlocked = mDozeGuardBlockedUids.size() > 0;
+                mDozeGuardBlockedUids.clear();
+                mDozeGuardLastBytes.clear();
+                mDozeGuardQuietSince.clear();
+                if (hadBlocked) {
+                    Slog.i(TAG, "Doze wake lock guard: restoring foreground service wake locks");
+                    updateWakeLockDisabledStatesLocked();
+                }
+                return;
+            }
+            for (int i = 0; i < mWakeLocks.size(); i++) {
+                final WakeLock wl = mWakeLocks.get(i);
+                if ((wl.mFlags & PowerManager.WAKE_LOCK_LEVEL_MASK)
+                        != PowerManager.PARTIAL_WAKE_LOCK) {
+                    continue;
+                }
+                final int appid = UserHandle.getAppId(wl.mOwnerUid);
+                final int procState = wl.mUidState.mProcState;
+                if (appid < Process.FIRST_APPLICATION_UID
+                        || Arrays.binarySearch(mDeviceIdleWhitelist, appid) >= 0
+                        || Arrays.binarySearch(mDeviceIdleTempWhitelist, appid) >= 0
+                        || procState <= ActivityManager.PROCESS_STATE_BOUND_TOP
+                        || procState > ActivityManager.PROCESS_STATE_BOUND_FOREGROUND_SERVICE) {
+                    continue;
+                }
+                if (candidates.indexOf(wl.mOwnerUid) < 0) {
+                    candidates.add(wl.mOwnerUid);
+                }
+            }
+        }
+
+        final ActivityManagerInternal ami = LocalServices.getService(ActivityManagerInternal.class);
+        final long now = SystemClock.elapsedRealtime();
+        final SparseBooleanArray blocked = new SparseBooleanArray();
+        for (int i = 0; i < candidates.size(); i++) {
+            final int uid = candidates.get(i);
+            final long rx = TrafficStats.getUidRxBytes(uid);
+            final long tx = TrafficStats.getUidTxBytes(uid);
+            final long bytes = Math.max(rx, 0) + Math.max(tx, 0);
+            final long last = mDozeGuardLastBytes.get(uid, -1);
+            mDozeGuardLastBytes.put(uid, bytes);
+            final boolean critical = ami != null
+                    && ami.hasRunningForegroundService(uid, DOZE_GUARD_KEEP_TYPES);
+            if (critical || last < 0 || bytes - last >= DOZE_GUARD_ACTIVE_BYTES) {
+                mDozeGuardQuietSince.put(uid, now);
+                continue;
+            }
+            if (now - mDozeGuardQuietSince.get(uid, now) >= DOZE_GUARD_QUIET_MS) {
+                blocked.put(uid, true);
+            }
+        }
+        // Forget uids that no longer hold a candidate wake lock.
+        for (int i = mDozeGuardLastBytes.size() - 1; i >= 0; i--) {
+            if (candidates.indexOf(mDozeGuardLastBytes.keyAt(i)) < 0) {
+                mDozeGuardQuietSince.delete(mDozeGuardLastBytes.keyAt(i));
+                mDozeGuardLastBytes.removeAt(i);
+            }
+        }
+
+        synchronized (mLock) {
+            if (!mDeviceIdleMode || !mDozeWakeLockGuardEnabled) {
+                scheduleDozeWakeLockGuardLocked(0);
+                return;
+            }
+            boolean changed = blocked.size() != mDozeGuardBlockedUids.size();
+            for (int i = 0; !changed && i < blocked.size(); i++) {
+                changed = !mDozeGuardBlockedUids.get(blocked.keyAt(i));
+            }
+            if (changed) {
+                for (int i = 0; i < blocked.size(); i++) {
+                    if (!mDozeGuardBlockedUids.get(blocked.keyAt(i))) {
+                        Slog.i(TAG, "Doze wake lock guard: releasing idle foreground service"
+                                + " wake locks of uid " + blocked.keyAt(i));
+                    }
+                }
+                mDozeGuardBlockedUids.clear();
+                for (int i = 0; i < blocked.size(); i++) {
+                    mDozeGuardBlockedUids.put(blocked.keyAt(i), true);
+                }
+                updateWakeLockDisabledStatesLocked();
+            }
+            // Uptime based: never wakes the device, only runs while something keeps it awake.
+            scheduleDozeWakeLockGuardLocked(DOZE_GUARD_CHECK_INTERVAL_MS);
+        }
+    }
+
+    @GuardedBy("mLock")
     private void updateWakeLockDisabledStatesLocked(List<WakeLock> wakelocks) {
         boolean changed = false;
         int numWakeLocks = wakelocks.size();
@@ -5195,6 +5368,13 @@ public final class PowerManagerService extends SystemService
                                     ActivityManager.PROCESS_STATE_BOUND_FOREGROUND_SERVICE) {
                         disabled = true;
                     }
+                }
+                if (!disabled && mDeviceIdleMode && mDozeWakeLockGuardEnabled
+                        && mDozeGuardBlockedUids.get(wakeLock.mOwnerUid)
+                        && Arrays.binarySearch(mDeviceIdleWhitelist, appid) < 0
+                        && Arrays.binarySearch(mDeviceIdleTempWhitelist, appid) < 0) {
+                    // A foreground service that has done nothing for a while in deep idle.
+                    disabled = true;
                 }
                 if (mLowPowerStandbyActive) {
                     final UidState state = wakeLock.mUidState;
@@ -5578,6 +5758,8 @@ public final class PowerManagerService extends SystemService
             pw.println("  mBatteryLevelLow=" + mBatteryLevelLow);
             pw.println("  mLightDeviceIdleMode=" + mLightDeviceIdleMode);
             pw.println("  mDeviceIdleMode=" + mDeviceIdleMode);
+            pw.println("  mDozeWakeLockGuardEnabled=" + mDozeWakeLockGuardEnabled
+                    + " blockedUids=" + mDozeGuardBlockedUids);
             pw.println("  mDeviceIdleWhitelist=" + Arrays.toString(mDeviceIdleWhitelist));
             pw.println("  mDeviceIdleTempWhitelist=" + Arrays.toString(mDeviceIdleTempWhitelist));
             pw.println("  mLowPowerStandbyActive=" + mLowPowerStandbyActive);
@@ -5661,6 +5843,7 @@ public final class PowerManagerService extends SystemService
             pw.println("  mScreenBrightnessDefault=" + mScreenBrightnessDefault);
             pw.println("  mGesturesEnabled=" + mGesturesEnabled);
             pw.println("  mDoubleTapEnabled=" + mDoubleTapEnabled);
+            pw.println("  mScreenOffTapEnabled=" + mScreenOffTapEnabled);
             pw.println("  mSingleTapEnabled=" + mSingleTapEnabled);
             pw.println("  mDrawVEnabled=" + mDrawVEnabled);
             pw.println("  mDrawInverseVEnabled=" + mDrawInverseVEnabled);
@@ -6285,6 +6468,9 @@ public final class PowerManagerService extends SystemService
                     break;
                 case MSG_PROCESS_FROZEN_STATE_CHANGED:
                     handleProcessFrozenStateChange(msg.obj, msg.arg1);
+                    break;
+                case MSG_DOZE_WAKELOCK_GUARD:
+                    handleDozeWakeLockGuard();
                     break;
                 case MSG_FORCE_DISABLE_WAKELOCKS:
                     IntArray groupIdsToActUpon = new IntArray();
